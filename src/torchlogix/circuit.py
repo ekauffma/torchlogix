@@ -170,6 +170,8 @@ class SumReduction:
     tau:       float = 1.0
     beta:      float = 0.0
 
+
+
     def get_max_value(self) -> int | None:
         """Return the max possible integer output, or None if the output is float (tau≠1 or fractional beta)."""
         if self.tau != 1.0 or self.beta != round(self.beta):
@@ -190,6 +192,77 @@ def _c_output_dtype(reductions: list[SumReduction]) -> str:
 
 
 @dataclass
+class AIGOutputSpec:
+    """Describes one logical Circuit output within AIGGraph.outputs.
+
+    start_bit/width index into the flat AIGGraph.outputs list: the bits for
+    this output are outputs[start_bit : start_bit + width]. This is the
+    metadata a downstream consumer needs to reconstruct a torchlogix output
+    (a single bool, or an unsigned integer score) from the AIG's anonymous
+    output wires -- see docs/guides/aig_export.md.
+    """
+    start_bit: int
+    width:     int
+    kind:      str            # "bool" or "uint"
+    bit_order: str = "lsb_first"
+    tau:       float = 1.0
+    beta:      float = 0.0
+
+
+@dataclass
+class AIGGraph:
+    n_inputs: int
+    and_gates: list
+    outputs: list
+    output_specs: list = field(default_factory=list)
+    output_shape: list = field(default_factory=list)
+
+    def write_to_aiger_file(self, path="circuit.aig"):
+
+        i = self.n_inputs 
+        l = 0
+        o = len(self.outputs)
+        a = len(self.and_gates)
+        m = i + l + a
+        with open(path, "wb") as f:
+            f.write(f"aig {m} {i} {l} {o} {a}\n".encode())
+            for lit in self.outputs:
+                f.write(f"{lit}\n".encode())
+            for lhs, rhs0, rhs1 in self.and_gates:
+
+                if rhs0 < rhs1:
+                    rhs0, rhs1 = rhs1, rhs0
+
+                if not (lhs > rhs0 >= rhs1):
+                    raise ValueError(
+                        "invalid AND gate: AIGER requires lhs > rhs0 >= rhs1, "
+                        f"got lhs={lhs}, rhs0={rhs0}, rhs1={rhs1}"
+                    )
+
+                delta0 = lhs - rhs0
+                delta1 = rhs0 - rhs1
+
+                n = delta0
+                delta0_bytes = []
+
+                
+                while n>= 128:
+                    remain = n % 128
+                    delta0_bytes.append(remain + 128)
+                    n = n // 128
+                delta0_bytes.append(n)
+                f.write(bytes(delta0_bytes))
+                n1 = delta1
+                delta1_bytes = []
+                while n1>= 128:
+                    remain = n1 % 128
+                    delta1_bytes.append(remain + 128)
+                    n1 = n1 // 128
+                delta1_bytes.append(n1)
+                f.write(bytes(delta1_bytes))
+
+
+@dataclass
 class Circuit:
     n_inputs:    int
     input_shape: list[int]          # original shape of the input tensor
@@ -202,6 +275,180 @@ class Circuit:
     def _sum_by_id(self) -> dict[int, SumReduction]:
         return {sr.node_id: sr for sr in self.sum_nodes}
     
+    def to_and_inverter_graph(self):
+     
+        lit_of = {}
+        
+        for i in range(self.n_inputs):
+            lit_of[i] = 2 * (i + 1)
+       
+        and_gates = []
+        
+        next_var = self.n_inputs + 1
+        
+        for g in self.gates:
+            
+            a_lit = lit_of[g.in0] if g.in0 >= 0 else 0
+            
+            b_lit = lit_of[g.in1] if g.in1 >= 0 else 0
+           
+            if g.op == GateOp.CONST_FALSE:
+                lit = 0
+            elif g.op == GateOp.CONST_TRUE:
+                lit = 1
+            elif g.op == GateOp.WIRE:
+                lit = a_lit
+            elif g.op in (GateOp.NOT, GateOp.NOT_A):
+                lit = a_lit ^ 1
+            elif g.op == GateOp.NOT_B:
+                lit = b_lit ^ 1
+            elif g.op == GateOp.AND:
+                
+                var = next_var
+                
+                next_var = next_var + 1
+               
+                and_gates.append( (2 * var, a_lit, b_lit) )
+                
+                lit = var * 2
+            elif g.op == GateOp.NAND:
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit, b_lit) )
+                lit = (var * 2) ^ 1
+            elif g.op == GateOp.OR:
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( ( 2 * var, a_lit ^ 1, b_lit ^ 1) )
+                lit = (var * 2 ) ^ 1
+            elif g.op == GateOp.NOR:
+                var = next_var
+                next_var = next_var + 1
+                # !A AND !B
+                and_gates.append( (2 * var, a_lit ^ 1, b_lit ^ 1))
+                lit = var * 2
+            elif g.op == GateOp.AND_NOT_B:
+                var = next_var
+                next_var = next_var + 1
+                # A AND NOT B (A AND !B)
+                and_gates.append( (2 * var, a_lit, b_lit ^ 1) )
+                lit = var * 2
+            elif g.op == GateOp.AND_NOT_A:
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit ^ 1, b_lit) )
+                lit = var * 2
+            elif g.op == GateOp.OR_NOT_B:
+                var = next_var
+                next_var = next_var + 1
+              
+                and_gates.append( (2 * var, a_lit ^ 1, b_lit) )
+                lit = (var * 2) ^ 1
+            elif g.op == GateOp.OR_NOT_A:
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit, b_lit ^ 1) )
+                lit = (var * 2) ^ 1
+            elif g.op == GateOp.XOR:
+                
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit, b_lit ^ 1) )
+                t1 = (var * 2)
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit ^ 1, b_lit) )
+                t2 = (var * 2)
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, t1 ^ 1, t2 ^ 1) )
+                lit = (var * 2) ^ 1
+            elif g.op == GateOp.XNOR:
+                
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit, b_lit ^ 1) )
+                t1 = (var * 2)
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, a_lit ^ 1, b_lit) )
+                t2 = (var * 2)
+                var = next_var
+                next_var = next_var + 1
+                and_gates.append( (2 * var, t1 ^ 1, t2 ^ 1) )
+                lit = (var * 2)
+
+            lit_of[g.gate_id] = lit
+
+
+
+        outputs = []
+        output_specs = []
+
+        for out_id in self.outputs:
+
+            if out_id in self._sum_by_id:
+                sr = self._sum_by_id[out_id]
+                if sr.tau != 1.0 or sr.beta != 0.0:
+                    raise ValueError(
+                        "AIG export requires tau == 1 and beta == 0 "
+                        f"(got tau={sr.tau}, beta={sr.beta}); non-default tau/beta "
+                        "are not representable in an AND-inverter graph"
+                    )
+
+                max_value = len(sr.input_ids)
+
+                n_bits = max(1, max_value.bit_length())
+
+                accumulator = [0] * n_bits
+
+                for gid in sr.input_ids:
+                    wire_lit = lit_of[gid]
+                    carry = wire_lit
+
+                    for i in range(n_bits):
+                        var = next_var
+                        next_var = next_var + 1
+                        and_gates.append( (2 * var, accumulator[i], carry ^ 1) )
+                        t1 = (var * 2)
+                        var = next_var
+                        next_var = next_var + 1
+                        and_gates.append( (2 * var, accumulator[i] ^ 1, carry) )
+                        t2 = (var * 2)
+                        var = next_var
+                        next_var = next_var + 1
+                        and_gates.append( (2 * var, t1 ^ 1, t2 ^ 1) )
+                        sum_lit = (var * 2) ^ 1
+
+                        var = next_var
+                        next_var = next_var + 1
+                        and_gates.append( (2 * var, accumulator[i], carry) )
+                        carry_lit = (var * 2)
+
+
+                        accumulator[i] = sum_lit
+                        carry = carry_lit
+
+                output_specs.append(AIGOutputSpec(
+                    start_bit=len(outputs), width=n_bits, kind="uint",
+                    bit_order="lsb_first", tau=sr.tau, beta=sr.beta,
+                ))
+                outputs.extend(accumulator)
+            else:
+                output_specs.append(AIGOutputSpec(
+                    start_bit=len(outputs), width=1, kind="bool",
+                    bit_order="lsb_first", tau=1.0, beta=0.0,
+                ))
+                outputs.append(lit_of[out_id])
+        return AIGGraph(n_inputs=self.n_inputs, and_gates=and_gates, outputs=outputs,
+                         output_specs=output_specs, output_shape=list(self.output_shape))
+
+  
+    def write_to_aiger_file(self, path="circuit.aig"):        
+        deliverable = self.to_and_inverter_graph()
+        deliverable.write_to_aiger_file(path)
+
+
     def __repr__(self) -> str:
         return (
             f"Circuit(\n"
