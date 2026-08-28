@@ -125,6 +125,17 @@ class _LogicConvNd(LogicBase):
         )
         return self.connections
 
+    def _apply_padding(self, x):
+        """Zero-pad the spatial dims by ``self.padding`` on both sides.
+
+        Subclasses whose connections handle padding themselves override this
+        to a no-op (see ``_LogicConvTransposeNd``).
+        """
+        if self.padding > 0:
+            pad = (self.padding, self.padding) * self.conv_dimension
+            x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
+        return x
+
     def forward(self, x):
         """Applies the logic convolution to the input.
 
@@ -154,10 +165,8 @@ class _LogicConvNd(LogicBase):
         if self.export_mode:
             return self._forward_export_mode(x)
         
-        if self.padding > 0:
-            pad = (self.padding, self.padding) * self.conv_dimension
-            x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
-        
+        x = self._apply_padding(x)
+
         # First level tree indices
         x = self.connections(x, 0)
         # Process first level with einsum contraction
@@ -182,14 +191,7 @@ class _LogicConvNd(LogicBase):
 
     def _forward_export_mode(self, x):
 
-        # Padding
-        if self.padding > 0:
-            x = torch.nn.functional.pad(
-                x,
-                (self.padding, self.padding, self.padding, self.padding, 0, 0),
-                mode="constant",
-                value=0
-            )
+        x = self._apply_padding(x)
 
         # First level
         x = self.connections(x, 0)
@@ -429,6 +431,18 @@ class _LogicConvTransposeNd(_LogicConvNd):
             connections_kwargs=connections_kwargs,
         )
 
+        # The base class computes kernel_positions with the forward-conv
+        # formula, which is wrong here; the transposed output is larger.
+        self.kernel_positions = list(self._out_dim())
+        self.n_kernel_positions = math.prod(self.kernel_positions)
+
+    def _apply_padding(self, x):
+        """No-op: ``FixedConvTransposeConnections`` dilates and pads internally.
+
+        Padding here as well would double-pad the effective input.
+        """
+        return x
+
     def _normalize_output_padding(self, output_padding):
         """Normalise output_padding to a tuple matching conv_dimension."""
         op = _pair(output_padding) if self.conv_dimension == 2 else _triple(output_padding)
@@ -466,35 +480,6 @@ class _LogicConvTransposeNd(_LogicConvNd):
             **self.connections_kwargs
         )
         return self.connections
-
-    def forward(self, x):
-        """Apply the transposed logic convolution to the input.
-
-        Args:
-            x: Input tensor of shape ``(batch, channels, *in_dim)``.
-
-        Returns:
-            Tensor of shape ``(batch, num_kernels, *out_dim)`` where
-            ``out_dim`` is given by ``_out_dim()``.
-        """
-
-        # Level 0: connections dilate x and gather receptive-field positions.
-        x = self.connections(x, 0)
-        x = self.parametrization.forward(
-            x, self.tree_weights[0], self.training,
-            contraction='fc,bcsf->bcsf'
-        )
-        
-        # Remaining levels
-        for level in range(1, self.tree_depth):
-            x = self.connections(x, level)
-            x = x.movedim(-2, 1)
-            x = self.parametrization.forward(
-                x, self.tree_weights[level], self.training,
-                contraction='fc,bcsf->bcsf'
-            )
-        x = x.view(x.shape[0], x.shape[1], *self._out_dim())
-        return x
 
 class LogicConvTranspose2d(_LogicConvTransposeNd):
     """2D transposed convolutional layer with differentiable logic operations.

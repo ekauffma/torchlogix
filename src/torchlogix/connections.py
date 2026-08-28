@@ -777,27 +777,33 @@ class FixedConvTransposeConnections(FixedConvConnections):
         )
 
     def _make_dilated_input(self, x):
-        """Insert (orig_stride - 1) zeros between input elements and append output_padding zeros."""
+        """Insert (orig_stride - 1) zeros between input elements and append output_padding zeros.
+
+        Built purely out of pad/reshape/slice rather than by allocating a zero
+        tensor and writing into it: an in-place mutation of a freshly created
+        constant is untraceable for circuit export (``constant_fold_views``
+        rejects it outright), so each spatial axis is dilated functionally.
+        """
         if self.orig_stride == 1 and all(op == 0 for op in self.output_padding_t):
             return x
 
-        B, C = x.shape[0], x.shape[1]
-        spatial = x.shape[2:]
-        dilated_size = tuple(
-            (s - 1) * self.orig_stride + 1 + op
-            for s, op in zip(spatial, self.output_padding_t)
-        )
-
-        out = torch.zeros(B, C, *dilated_size, device=x.device, dtype=x.dtype)
-
-        # Place input values at stride-spaced positions; output_padding tail stays zero.
-        src_slices = (slice(None), slice(None)) + tuple(
-            slice(None, (s - 1) * self.orig_stride + 1, self.orig_stride)
-            for s in spatial
-        )
-
-        out[src_slices] = x
-        return out
+        stride = self.orig_stride
+        for axis, op in enumerate(self.output_padding_t):
+            dim = 2 + axis
+            n = x.shape[dim]
+            x = x.movedim(dim, -1)
+            if stride > 1:
+                # (..., n) -> (..., n, stride) -> (..., n * stride), then drop the
+                # trailing stride-1 zeros so the axis ends up (n - 1) * stride + 1.
+                x = torch.nn.functional.pad(
+                    x.reshape(*x.shape, 1), (0, stride - 1), mode="constant", value=0
+                )
+                x = x.reshape(*x.shape[:-2], n * stride)
+                x = x[..., : (n - 1) * stride + 1]
+            if op > 0:
+                x = torch.nn.functional.pad(x, (0, op), mode="constant", value=0)
+            x = x.movedim(-1, dim)
+        return x
 
     def forward(self, x, tree_level):
         if tree_level == 0:
