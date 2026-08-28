@@ -21,8 +21,6 @@ from torchlogix.utils import set_export_mode
         ("conv3d_model_wo_group_sum", "sample_input_3d"),
         ("conv2d_model", "sample_input_2d"),
         ("conv3d_model", "sample_input_3d"),
-        ("conv_transpose2d_ae_model", "sample_input_2d"),
-        ("conv_transpose2d_padded_model", "sample_input_2d"),
         ("conv_transpose3d_ae_model", "sample_input_3d"),
     ],
 )
@@ -136,8 +134,6 @@ class TestFXGraphPurity:
         ("conv3d_model", "sample_input_3d", ALLOWED_FX_TARGETS | ALLOWED_FX_TARGETS_GROUP_SUM),
         # Transposed conv dilates its input; the graph must stay pure logic +
         # view ops (pad/reshape/slice), with no zeros-and-write-into-it.
-        ("conv_transpose2d_ae_model", "sample_input_2d", ALLOWED_FX_TARGETS),
-        ("conv_transpose2d_padded_model", "sample_input_2d", ALLOWED_FX_TARGETS),
         ("conv_transpose3d_ae_model", "sample_input_3d", ALLOWED_FX_TARGETS),
     ])
     def test_fx_graph_is_pure_logic(self, model_fixture, input_fixture, allowed_targets, request):

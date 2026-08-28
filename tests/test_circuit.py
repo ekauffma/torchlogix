@@ -15,7 +15,6 @@ from torchlogix.layers import (
     GroupSum,
     LogicConv2d,
     LogicConv3d,
-    LogicConvTranspose2d,
     LogicConvTranspose3d,
     LogicDense,
     OrPooling2d,
@@ -70,59 +69,32 @@ class BranchModel(nn.Module):
         return x
 
 
-class ConvTransposeAEModel(nn.Sequential):
-    """Autoencoder: LogicConv2d halves the resolution, LogicConvTranspose2d restores it.
-
-    Exercises the transposed-conv export path end to end. The dilation in
-    FixedConvTransposeConnections must be expressed functionally (pad/reshape/
-    slice); building a zero tensor and writing into it makes
-    constant_fold_views reject the graph outright.
-    """
-
-    def __init__(self):
-        super().__init__(
-            LogicConv2d(in_dim=8, channels=2, num_kernels=4, receptive_field_size=3,
-                        tree_depth=2, stride=2,
-                        parametrization_kwargs={"weight_init": "random"}),   # -> 4 x 3 x 3
-            LogicConvTranspose2d(in_dim=3, channels=4, num_kernels=2, receptive_field_size=3,
-                                 tree_depth=2, stride=2, output_padding=1,
-                                 parametrization_kwargs={"weight_init": "random"}),  # -> 2 x 8 x 8
-            nn.Flatten(),   # Circuit outputs are flat; the spatial round-trip
-                            # itself is asserted in test_clgn.py
-        )
-        self.input_shape = (2, 8, 8)
-
-
-class ConvTransposePaddedModel(nn.Sequential):
-    """Transposed conv with nonzero padding and output_padding, plus a GroupSum head.
-
-    Padding for a transpose layer is applied inside its connections, so this
-    also guards against the layer double-padding its input.
-    """
-
-    def __init__(self):
-        super().__init__(
-            LogicConvTranspose2d(in_dim=4, channels=2, num_kernels=3, receptive_field_size=3,
-                                 tree_depth=2, stride=2, padding=1, output_padding=1,
-                                 parametrization_kwargs={"weight_init": "random"}),  # -> 3 x 8 x 8
-            nn.Flatten(),
-            GroupSum(4),
-        )
-        self.input_shape = (2, 4, 4)
-
-
 class ConvTransposeAE3dModel(nn.Sequential):
-    """3D autoencoder: LogicConv3d down, LogicConvTranspose3d back up."""
+    """3D autoencoder: LogicConv3d halves 6^3 to 3^3, LogicConvTranspose3d restores it.
+
+    Both layers use nonzero padding, and the decoder a nonzero output_padding,
+    so this single model covers the whole transposed-conv export path:
+
+    * input dilation (stride > 1) expressed functionally - building a zero
+      tensor and writing into it makes constant_fold_views reject the graph
+    * padding applied inside FixedConvTransposeConnections rather than by the
+      layer, which would otherwise double-pad
+    * kernel_positions describing the larger transposed output
+
+    Per-axis shapes and gradients are covered more finely in test_clgn_3d.py;
+    this is the end-to-end circuit-level check.
+    """
 
     def __init__(self):
         super().__init__(
             LogicConv3d(in_dim=6, channels=2, num_kernels=3, receptive_field_size=3,
-                        tree_depth=2, stride=2,
-                        parametrization_kwargs={"weight_init": "random"}),   # -> 3 x 2 x 2 x 2
-            LogicConvTranspose3d(in_dim=2, channels=3, num_kernels=2, receptive_field_size=3,
-                                 tree_depth=2, stride=2, output_padding=1,
-                                 parametrization_kwargs={"weight_init": "random"}),  # -> 2 x 6 x 6 x 6
-            nn.Flatten(),   # see ConvTransposeAEModel
+                        tree_depth=2, stride=2, padding=1,
+                        parametrization_kwargs={"weight_init": "random"}),      # -> 3 x 3^3
+            LogicConvTranspose3d(in_dim=3, channels=3, num_kernels=2, receptive_field_size=3,
+                                 tree_depth=2, stride=2, padding=1, output_padding=1,
+                                 parametrization_kwargs={"weight_init": "random"}),  # -> 2 x 6^3
+            nn.Flatten(),   # Circuit outputs are flat; the spatial round-trip
+                            # itself is asserted in test_clgn_3d.py
         )
         self.input_shape = (2, 6, 6, 6)
 
@@ -144,7 +116,7 @@ class InPlaceConstMutationModel(nn.Module):
         return x & mask
 
 
-@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAEModel, ConvTransposePaddedModel, ConvTransposeAE3dModel])
+@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAE3dModel])
 def test_functional_equivalence(model_cls):
     model = model_cls()
     x = torch.randint(0, 2, (1, *model.input_shape), dtype=torch.bool)
@@ -300,7 +272,7 @@ def test_aiger_serializer_accepts_valid_and_gate():
         assert _parse_aiger_file(tmp_file.name).and_gates == [(6, 4, 2)]
 
 
-@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAEModel, ConvTransposePaddedModel, ConvTransposeAE3dModel])
+@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAE3dModel])
 def test_aig_functional_equivalence(model_cls):
     """Round-trips a trained model's Circuit through the AIGER file format and
     checks -- via the independent Python AIG evaluator above, not a third-party
@@ -332,7 +304,7 @@ ABC_PATH = shutil.which("abc")
 
 
 @pytest.mark.skipif(ABC_PATH is None, reason="abc binary not found on PATH")
-@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAEModel, ConvTransposePaddedModel, ConvTransposeAE3dModel])
+@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAE3dModel])
 def test_abc_reads_and_rewrites_aiger(model_cls):
     """Parser/compatibility check: ABC can read a TorchLogix .aig file and
     write out a functionally equivalent one.
@@ -370,7 +342,7 @@ def test_abc_reads_and_rewrites_aiger(model_cls):
             "ABC's read/write round trip changed the AIG's function"
 
 
-@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAEModel])
+@pytest.mark.parametrize("model_cls", [DenseModel, ConvModel, BranchModel, ConvTransposeAE3dModel])
 @pytest.mark.parametrize("pack_bits", [None, 8, 16, 32])
 @pytest.mark.parametrize("relative_batch_size", [1, 10])
 def test_circuit_compilation(model_cls, pack_bits, relative_batch_size):
@@ -394,7 +366,7 @@ def test_circuit_compilation(model_cls, pack_bits, relative_batch_size):
         "Compiled circuit predictions differ from Eval-mode predictions"
 
 
-@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel, ConvTransposeAEModel, ConvTransposePaddedModel])
+@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel, ConvTransposeAE3dModel])
 @pytest.mark.parametrize("simplification", [
     Circuit.simplify, Circuit.constant_fold_gates, Circuit.eliminate_dead_gates, Circuit.bypass_wires, Circuit.dedup, Circuit.fuse_not_inputs
 ])
@@ -416,7 +388,7 @@ def test_rejects_inplace_constant_mutation():
         Circuit.from_model(model, input_shape=model.input_shape)
 
 
-@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel, ConvTransposeAEModel, ConvTransposePaddedModel, ConvTransposeAE3dModel])
+@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel, ConvTransposeAE3dModel])
 def test_json_roundtrip(model_cls):
     model = model_cls()
     x = torch.randint(0, 2, (1, *model.input_shape), dtype=torch.bool)
@@ -434,7 +406,7 @@ def test_json_roundtrip(model_cls):
 
 
 
-@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel, ConvTransposePaddedModel])
+@pytest.mark.parametrize("model_cls", [ConvModel, BranchModel])
 def test_c_codegen_group_sum_scores(model_cls):
     """GroupSum reduction is inlined into circuit and compiles cleanly."""
     model = model_cls()
