@@ -17,6 +17,8 @@ from torchlogix.layers import (
     GroupSum,
     LogicConv2d,
     LogicConv3d,
+    LogicConvTranspose2d,
+    LogicConvTranspose3d,
     LogicDense,
     OrPooling2d,
     OrPooling3d,
@@ -94,6 +96,47 @@ def conv3d_model():
 def single_3d_conv_model():
     model = nn.Sequential(
         LogicConv3d(in_dim=8, channels=3, num_kernels=8, receptive_field_size=3, tree_depth=2),
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def conv_transpose2d_ae_model():
+    """Autoencoder: LogicConv2d halves 8x8 to 3x3, LogicConvTranspose2d restores 8x8."""
+    model = nn.Sequential(
+        LogicConv2d(in_dim=8, channels=3, num_kernels=4, receptive_field_size=3,
+                    tree_depth=2, stride=2),
+        LogicConvTranspose2d(in_dim=3, channels=4, num_kernels=3, receptive_field_size=3,
+                             tree_depth=2, stride=2, output_padding=1),
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def conv_transpose2d_padded_model():
+    """Transposed conv with nonzero padding and output_padding.
+
+    Padding is applied inside FixedConvTransposeConnections, so this catches a
+    layer that double-pads its input.
+    """
+    model = nn.Sequential(
+        LogicConvTranspose2d(in_dim=8, channels=3, num_kernels=4, receptive_field_size=3,
+                             tree_depth=2, stride=2, padding=1, output_padding=1),
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def conv_transpose3d_ae_model():
+    """3D autoencoder: LogicConv3d down, LogicConvTranspose3d back up."""
+    model = nn.Sequential(
+        LogicConv3d(in_dim=8, channels=3, num_kernels=4, receptive_field_size=3,
+                    tree_depth=2, stride=2),
+        LogicConvTranspose3d(in_dim=3, channels=4, num_kernels=3, receptive_field_size=3,
+                             tree_depth=2, stride=2, output_padding=1),
     )
     model.eval()
     return model
